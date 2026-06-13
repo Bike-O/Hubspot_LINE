@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="ja"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>不成立 LINE登録率ダッシュボード</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Hiragino Sans','Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif;background:#f5f5f3;color:#1a1a1a;padding:2rem;font-size:16px}
+.wrap{max-width:980px;margin:0 auto}
+.header{display:flex;align-items:center;gap:8px;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid #e0e0dc}
+.header-title{font-size:22px;font-weight:600}
+.header-sub{font-size:14px;color:#888}
+.badge{margin-left:auto;font-size:12px;background:#e1f5ee;color:#0f6e56;padding:3px 10px;border-radius:6px;white-space:nowrap}
+.upload-bar{display:flex;gap:16px;flex-wrap:wrap;align-items:center;background:#fff;border:1px solid #e8e8e4;border-radius:10px;padding:12px 16px;margin-bottom:1.5rem}
+.upload-group{display:flex;align-items:center;gap:8px}
+.upload-lbl{font-size:13px;font-weight:600;color:#444;white-space:nowrap;min-width:90px}
+.upload-btn{font-size:13px;padding:6px 14px;border-radius:6px;border:1px solid #c0c0bb;cursor:pointer;background:#f5f5f3;color:#444;font-family:inherit;white-space:nowrap}
+.upload-btn:hover{background:#eae8e4}
+.upload-st{font-size:12px;color:#bbb;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upload-st.ok{color:#1D9E75}.upload-st.err{color:#D85A30}
+.spin{display:none;width:14px;height:14px;border:2px solid #e0e0dc;border-top-color:#1D9E75;border-radius:50%;animation:sp 0.7s linear infinite;flex-shrink:0}
+@keyframes sp{to{transform:rotate(360deg)}}
+.divider{width:1px;height:28px;background:#e0e0dc;flex-shrink:0}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:1.5rem}
+.kpi{background:#fff;border-radius:10px;border:1px solid #e8e8e4;padding:14px 18px}
+.kpi.hl{border-color:#1D9E75}
+.kpi-lbl{font-size:12px;color:#888;margin-bottom:4px}
+.kpi-val{font-size:28px;font-weight:600;line-height:1.1}
+.kpi-sub{font-size:12px;color:#aaa;margin-top:3px}
+.sec{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.sec-ttl{font-size:15px;font-weight:600}
+.sec-note{font-size:12px;color:#aaa}
+.sort-wrap{margin-left:auto;display:flex;align-items:center;gap:5px}
+.sort-lbl{font-size:12px;color:#aaa}
+.sort-btn{font-size:13px;padding:4px 12px;border-radius:6px;border:1px solid #d0d0cc;cursor:pointer;background:#fff;color:#888;font-family:inherit}
+.sort-btn.active{background:#f0f0ec;color:#1a1a1a;font-weight:600;border-color:#aaa}
+.legend{display:flex;gap:14px;margin-bottom:8px;font-size:13px;color:#888;flex-wrap:wrap}
+.li{display:flex;align-items:center;gap:4px}
+.ld{width:11px;height:11px;border-radius:2px;display:inline-block}
+.chart-card{background:#fff;border-radius:10px;border:1px solid #e8e8e4;padding:16px;margin-bottom:1.5rem}
+.grp-sel{font-size:13px;padding:6px 11px;border-radius:6px;border:1px solid #d0d0cc;background:#fff;color:#1a1a1a;font-family:inherit;cursor:pointer}
+.save-btn{font-size:13px;padding:6px 14px;border-radius:6px;border:1px solid #1D9E75;cursor:pointer;background:#e1f5ee;color:#0f6e56;font-family:inherit;font-weight:600;white-space:nowrap}
+.save-btn:hover{background:#c8edd e;}
+.load-btn{font-size:13px;padding:6px 14px;border-radius:6px;border:1px solid #378ADD;cursor:pointer;background:#e8f2fc;color:#1a5fa0;font-family:inherit;font-weight:600;white-space:nowrap}
+.load-btn:hover{background:#d0e6f8}
+table{width:100%;border-collapse:collapse;font-size:14px}
+thead tr:first-child th{padding:11px 12px;background:#f9f9f7;border-bottom:1px solid #e8e8e4;font-weight:600;color:#555;text-align:center}
+thead tr:first-child th:first-child{text-align:left;padding-left:16px}
+thead tr:nth-child(2) th{padding:5px 12px;background:#f9f9f7;border-bottom:1px solid #e8e8e4;font-size:12px;font-weight:400;color:#aaa;text-align:center}
+thead tr:nth-child(2) th:first-child{text-align:left;padding-left:16px}
+.bl{border-left:1px solid #e8e8e4}
+tbody tr{border-bottom:1px solid #f0f0ec}
+tbody td{padding:9px 12px;text-align:center;color:#555}
+tbody td:first-child{text-align:left;padding-left:16px;font-weight:500;color:#1a1a1a}
+tfoot td{padding:9px 12px;text-align:center;color:#555;border-top:1px solid #e8e8e4;background:#f9f9f7}
+tfoot td:first-child{text-align:left;padding-left:16px;font-weight:600;color:#1a1a1a}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="wrap">
+
+<div class="header">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1D9E75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M3 9h18M9 21V9"></path></svg>
+  <span class="header-title">不成立 LINE登録率ダッシュボード</span>
+  <span class="header-sub">グループ別・月次推移</span>
+  <span class="badge">持込除外・査定日基準</span>
+</div>
+
+<div class="upload-bar">
+  <div class="upload-group">
+    <span class="upload-lbl">BLP_仕入</span>
+    <input type="file" id="blp-file" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleBLP(this)">
+    <button class="upload-btn" onclick="document.getElementById('blp-file').click()">ファイルを選択</button>
+    <div class="spin" id="blp-spin" style="display: none;"></div>
+    <span class="upload-st ok" id="blp-st">不成立LINE登録ダッシュボード用_BLP仕入.xlsx</span>
+  </div>
+  <div class="divider"></div>
+  <div class="upload-group">
+    <span class="upload-lbl">Hubspotデータ</span>
+    <input type="file" id="hub-file" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleHubspot(this)">
+    <button class="upload-btn" onclick="document.getElementById('hub-file').click()">ファイルを選択</button>
+    <div class="spin" id="hub-spin" style="display: none;"></div>
+    <span class="upload-st ok" id="hub-st">hubspot-crm-exports-line-2026-06-13.csv</span>
+  </div>
+  <div class="divider"></div>
+  <div class="upload-group" style="gap:8px;">
+    <input type="file" id="load-file" accept=".json" style="display:none" onchange="handleLoadJSON(this)">
+    <button class="save-btn" onclick="saveAsHTML()">📥 HTMLとして保存</button>
+    <span class="upload-st" id="save-st"></span>
+  </div>
+</div>
+
+<div class="kpi-grid" id="kpi-grid">
+    <div class="kpi"><div class="kpi-lbl">5月 登録率</div><div class="kpi-val">23.0%</div><div class="kpi-sub">653 / 2,837件</div></div>
+    <div class="kpi hl"><div class="kpi-lbl">6月 登録率</div><div class="kpi-val" style="color:#1D9E75">18.7%</div><div class="kpi-sub">154 / 825件</div></div>
+    <div class="kpi"><div class="kpi-lbl">前月比</div><div class="kpi-val" style="color:#D85A30">-4.4</div><div class="kpi-sub">5月 → 6月（pp）</div></div>
+    <div class="kpi"><div class="kpi-lbl">累計LINE登録</div><div class="kpi-val">1,083件</div><div class="kpi-sub">4月・5月・6月合計</div></div></div>
+
+<div class="sec">
+  <span class="sec-ttl" id="rate-ttl">グループ別 LINE登録率（5月 vs 6月）</span>
+  <div class="sort-wrap">
+    <span class="sort-lbl">並び順:</span>
+    <button class="sort-btn" id="sort-prev" onclick="setRateSort('prev')">5月</button>
+    <button class="sort-btn active" id="sort-curr" onclick="setRateSort('curr')">6月</button>
+  </div>
+</div>
+<div class="legend">
+  <span class="li"><span class="ld" style="background:#B4B2A9"></span><span id="leg-prev">5月</span></span>
+  <span class="li"><span class="ld" style="background:#1D9E75"></span><span id="leg-curr">6月</span></span>
+</div>
+<div class="chart-card">
+  <div style="position:relative;height:600px">
+    <canvas id="rateChart" role="img" aria-label="グループ別LINE登録率横棒グラフ" style="box-sizing: border-box; display: block; height: 600px; width: 624px;" width="781" height="750">グループ別LINE登録率比較。</canvas>
+  </div>
+</div>
+
+<div class="sec">
+  <span class="sec-ttl">不成立件数 月次推移</span>
+  <span class="sec-note">査定日基準・持込除外 / 右軸: LINE登録数</span>
+  <select class="grp-sel" id="mo-grp-sel" onchange="setMonthGrp(this.value)" style="margin-left:auto"><option value="ALL">全体</option><option value="北日本G">北日本G</option><option value="関東第一G">関東第一G</option><option value="関東第二G">関東第二G</option><option value="関東第三G">関東第三G</option><option value="関東第四G">関東第四G</option><option value="関東第五G">関東第五G</option><option value="東海第一G">東海第一G</option><option value="東海第二G">東海第二G</option><option value="近畿第一G">近畿第一G</option><option value="近畿第二G">近畿第二G</option><option value="中四国G">中四国G</option><option value="九州G">九州G</option></select>
+</div>
+<div class="legend">
+  <span class="li"><span class="ld" style="background:rgba(216,90,48,0.5)"></span>不成立件数</span>
+  <span class="li"><span class="ld" style="background:#1D9E75;border-radius:50%"></span>LINE登録（右軸）</span>
+</div>
+<div class="chart-card">
+  <div style="position:relative;height:220px">
+    <canvas id="monthlyChart" role="img" aria-label="不成立件数月次推移グラフ" style="box-sizing: border-box; display: block; height: 220px; width: 624px;" width="781" height="275">月次不成立件数とLINE登録数。</canvas>
+  </div>
+</div>
+
+<div class="sec">
+  <span class="sec-ttl">不成立件数 日次推移</span>
+  <span class="sec-note">査定日基準・持込除外 / 右軸: LINE登録数</span>
+  <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
+    <select class="grp-sel" id="month-sel" onchange="setMonth(this.value)"><option value="2026-04">4月</option><option value="2026-05">5月</option><option value="2026-06">6月</option></select>
+    <select class="grp-sel" id="grp-sel" onchange="setGroup(this.value)"><option value="ALL">全体</option><option value="北日本G">北日本G</option><option value="関東第一G">関東第一G</option><option value="関東第二G">関東第二G</option><option value="関東第三G">関東第三G</option><option value="関東第四G">関東第四G</option><option value="関東第五G">関東第五G</option><option value="東海第一G">東海第一G</option><option value="東海第二G">東海第二G</option><option value="近畿第一G">近畿第一G</option><option value="近畿第二G">近畿第二G</option><option value="中四国G">中四国G</option><option value="九州G">九州G</option></select>
+  </div>
+</div>
+<div class="legend">
+  <span class="li"><span class="ld" id="daily-bar-dot" style="background: rgba(216, 90, 48, 0.5);"></span>不成立件数</span>
+  <span class="li"><span class="ld" style="background:#1D9E75;border-radius:50%"></span>LINE登録（右軸）</span>
+</div>
+<div class="chart-card">
+  <div style="position:relative;height:240px">
+    <canvas id="dailyChart" role="img" aria-label="不成立件数日次推移グラフ" style="box-sizing: border-box; display: block; height: 240px; width: 624px;" width="781" height="300">日次不成立件数とLINE登録数。</canvas>
+  </div>
+</div>
+
+<div class="sec"><span class="sec-ttl">詳細データ</span></div>
+<div style="display:grid;grid-template-columns:3fr 2fr;gap:16px;align-items:start;margin-bottom:1.5rem">
+  <div class="tbl-wrap" style="margin-bottom:0">
+    <table>
+      <thead>
+        <tr>
+          <th>グループ</th>
+          <th colspan="3" class="bl" id="th-prev">5月</th>
+          <th colspan="3" class="bl" id="th-curr" style="color:#1D9E75">6月</th>
+          <th class="bl">変化</th>
+        </tr>
+        <tr>
+          <th></th>
+          <th class="bl">不成立</th><th>LINE</th><th>率</th>
+          <th class="bl">不成立</th><th>LINE</th><th>率</th>
+          <th class="bl">pp</th>
+        </tr>
+      </thead>
+      <tbody id="tbl-body"><tr><td>九州G</td>
+      <td class="bl">346</td><td>133</td><td style="font-weight:600;color:#0F6E56">38.4%</td>
+      <td class="bl">60</td><td>28</td><td style="font-weight:600;color:#0F6E56">46.7%</td>
+      <td class="bl" style="font-weight:600;color:#1D9E75">+8.2</td></tr><tr><td>東海第一G</td>
+      <td class="bl">161</td><td>36</td><td style="font-weight:600;color:#1D9E75">22.4%</td>
+      <td class="bl">31</td><td>10</td><td style="font-weight:600;color:#0F6E56">32.3%</td>
+      <td class="bl" style="font-weight:600;color:#1D9E75">+9.9</td></tr><tr><td>関東第一G</td>
+      <td class="bl">149</td><td>30</td><td style="font-weight:600;color:#1D9E75">20.1%</td>
+      <td class="bl">34</td><td>8</td><td style="font-weight:600;color:#1D9E75">23.5%</td>
+      <td class="bl" style="font-weight:600;color:#1D9E75">+3.4</td></tr><tr><td>関東第三G</td>
+      <td class="bl">305</td><td>46</td><td style="font-weight:600;color:#5DCAA5">15.1%</td>
+      <td class="bl">106</td><td>22</td><td style="font-weight:600;color:#1D9E75">20.8%</td>
+      <td class="bl" style="font-weight:600;color:#1D9E75">+5.7</td></tr><tr><td>関東第二G</td>
+      <td class="bl">191</td><td>54</td><td style="font-weight:600;color:#1D9E75">28.3%</td>
+      <td class="bl">44</td><td>8</td><td style="font-weight:600;color:#5DCAA5">18.2%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-10.1</td></tr><tr><td>中四国G</td>
+      <td class="bl">250</td><td>49</td><td style="font-weight:600;color:#5DCAA5">19.6%</td>
+      <td class="bl">80</td><td>14</td><td style="font-weight:600;color:#5DCAA5">17.5%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-2.1</td></tr><tr><td>関東第四G</td>
+      <td class="bl">243</td><td>71</td><td style="font-weight:600;color:#1D9E75">29.2%</td>
+      <td class="bl">90</td><td>15</td><td style="font-weight:600;color:#5DCAA5">16.7%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-12.6</td></tr><tr><td>東海第二G</td>
+      <td class="bl">176</td><td>46</td><td style="font-weight:600;color:#1D9E75">26.1%</td>
+      <td class="bl">57</td><td>9</td><td style="font-weight:600;color:#5DCAA5">15.8%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-10.3</td></tr><tr><td>関東第五G</td>
+      <td class="bl">249</td><td>82</td><td style="font-weight:600;color:#0F6E56">32.9%</td>
+      <td class="bl">77</td><td>12</td><td style="font-weight:600;color:#5DCAA5">15.6%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-17.3</td></tr><tr><td>北日本G</td>
+      <td class="bl">217</td><td>42</td><td style="font-weight:600;color:#5DCAA5">19.4%</td>
+      <td class="bl">73</td><td>11</td><td style="font-weight:600;color:#5DCAA5">15.1%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-4.3</td></tr><tr><td>近畿第二G</td>
+      <td class="bl">300</td><td>45</td><td style="font-weight:600;color:#5DCAA5">15.0%</td>
+      <td class="bl">88</td><td>11</td><td style="font-weight:600;color:#5DCAA5">12.5%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-2.5</td></tr><tr><td>近畿第一G</td>
+      <td class="bl">250</td><td>19</td><td style="font-weight:600;color:#bbb">7.6%</td>
+      <td class="bl">85</td><td>6</td><td style="font-weight:600;color:#bbb">7.1%</td>
+      <td class="bl" style="font-weight:600;color:#D85A30">-0.5</td></tr></tbody>
+      <tfoot><tr id="tbl-foot"><td>合計</td>
+    <td class="bl">2,837</td><td>653</td><td style="font-weight:600">23.0%</td>
+    <td class="bl">825</td><td>154</td><td style="font-weight:600;color:#1D9E75">18.7%</td>
+    <td class="bl" style="font-weight:600;color:#D85A30">-4.4</td></tr></tfoot>
+    </table>
+  </div>
+  <div>
+    <div style="font-size:14px;font-weight:600;color:#1a1a1a;margin-bottom:6px;">規模 vs 登録率 <span id="scatter-month" style="font-weight:400;font-size:12px;color:#888;">6月</span></div>
+    <div class="chart-card" style="margin-bottom:8px;">
+      <div style="position:relative;height:420px;">
+        <canvas id="scatterChart" role="img" aria-label="グループ別不成立件数と登録率の散布図" style="box-sizing: border-box; display: block; height: 420px; width: 300px;" width="375" height="525">グループ別の不成立件数（横軸）と登録率（縦軸）の相関。</canvas>
+      </div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px;color:#666;margin-top:2px;">
+      <span><span style="color:#1D9E75;font-size:13px;">●</span> 件数多・率高（優良）</span>
+      <span><span style="color:#D85A30;font-size:13px;">●</span> 件数多・率低（最優先）</span>
+      <span><span style="color:#378ADD;font-size:13px;">●</span> 件数少・率高（率良好）</span>
+      <span><span style="color:#B4B2A9;font-size:13px;">●</span> 件数少・率低（改善余地）</span>
+    </div>
+    <div style="font-size:11px;color:#bbb;margin-top:4px;">縦横の破線は12グループの平均値</div>
+  </div>
+</div>
+
+</div>
+<script>
+const DAILY_FUSEI_DEF={"2026-04-01":{"近畿第一G":7,"九州G":5,"関東第四G":7,"関東第三G":5,"東海第二G":6,"近畿第二G":5,"関東第二G":4,"中四国G":5,"関東第五G":9,"北日本G":5,"関東第一G":2},"2026-04-02":{"近畿第一G":6,"関東第二G":2,"関東第三G":7,"北日本G":2,"中四国G":4,"関東第一G":5,"近畿第二G":8,"東海第二G":6,"関東第四G":3,"東海第一G":2,"九州G":2,"関東第五G":1},"2026-04-03":{"中四国G":5,"近畿第一G":9,"関東第四G":5,"九州G":8,"近畿第二G":13,"関東第一G":1,"北日本G":7,"関東第五G":4,"関東第三G":5,"関東第二G":4,"東海第二G":3},"2026-04-04":{"北日本G":11,"九州G":15,"関東第一G":7,"中四国G":8,"近畿第二G":8,"関東第三G":9,"関東第五G":9,"東海第一G":7,"東海第二G":9,"関東第二G":8,"近畿第一G":19,"関東第四G":6},"2026-04-05":{"北日本G":11,"近畿第二G":7,"関東第五G":13,"中四国G":17,"九州G":25,"関東第三G":17,"関東第四G":10,"近畿第一G":13,"関東第二G":10,"東海第一G":4,"東海第二G":7,"関東第一G":6},"2026-04-06":{"九州G":15,"関東第三G":6,"中四国G":7,"北日本G":5,"近畿第二G":9,"関東第四G":8,"東海第一G":4,"近畿第一G":5,"関東第五G":13,"関東第二G":7,"東海第二G":5},"2026-04-07":{"九州G":10,"関東第四G":7,"近畿第一G":5,"北日本G":7,"東海第一G":5,"近畿第二G":7,"関東第三G":4,"関東第五G":5,"東海第二G":4,"中四国G":4,"関東第二G":8,"関東第一G":2},"2026-04-08":{"九州G":11,"北日本G":4,"中四国G":4,"東海第二G":5,"近畿第一G":6,"関東第二G":6,"関東第五G":4,"近畿第二G":9,"関東第四G":5,"関東第三G":3,"東海第一G":1},"2026-04-09":{"近畿第二G":5,"関東第三G":8,"九州G":3,"近畿第一G":11,"北日本G":7,"関東第四G":8,"東海第二G":6,"中四国G":4,"関東第二G":1,"東海第一G":2,"関東第五G":3,"関東第一G":1},"2026-04-10":{"九州G":8,"中四国G":8,"北日本G":5,"関東第三G":10,"近畿第二G":8,"東海第一G":5,"関東第二G":4,"近畿第一G":7,"関東第四G":3,"関東第五G":2,"関東第一G":3,"東海第二G":1},"2026-04-11":{"九州G":12,"中四国G":18,"関東第三G":15,"北日本G":10,"関東第五G":11,"近畿第一G":14,"関東第四G":10,"関東第二G":7,"東海第二G":4,"関東第一G":10,"近畿第二G":10,"東海第一G":8},"2026-04-12":{"北日本G":10,"近畿第二G":11,"関東第三G":14,"九州G":15,"関東第五G":12,"中四国G":10,"関東第一G":10,"東海第一G":6,"近畿第一G":8,"東海第二G":7,"関東第四G":12,"関東第二G":6},"2026-04-13":{"九州G":8,"関東第三G":9,"北日本G":4,"関東第四G":7,"中四国G":6,"近畿第二G":10,"東海第一G":5,"東海第二G":5,"近畿第一G":7,"関東第二G":4,"関東第五G":8},"2026-04-14":{"九州G":11,"近畿第一G":7,"東海第二G":4,"関東第五G":8,"関東第四G":10,"関東第三G":6,"東海第一G":5,"北日本G":4,"中四国G":2,"関東第二G":3,"近畿第二G":5,"関東第一G":2},"2026-04-15":{"中四国G":2,"近畿第一G":3,"関東第四G":10,"関東第三G":5,"近畿第二G":8,"関東第二G":2,"九州G":7,"関東第五G":6,"北日本G":5,"東海第二G":3,"関東第一G":3,"東海第一G":2},"2026-04-16":{"北日本G":3,"関東第五G":10,"中四国G":2,"九州G":7,"東海第一G":5,"東海第二G":3,"関東第三G":9,"近畿第二G":8,"関東第一G":1,"関東第四G":3,"近畿第一G":3,"関東第二G":2},"2026-04-17":{"九州G":13,"関東第三G":6,"中四国G":11,"近畿第一G":2,"関東第二G":2,"関東第一G":3,"関東第五G":6,"近畿第二G":6,"関東第四G":3,"東海第二G":1,"北日本G":1,"東海第一G":3},"2026-04-18":{"中四国G":15,"九州G":24,"東海第一G":12,"関東第三G":11,"関東第五G":13,"北日本G":9,"近畿第一G":11,"東海第二G":6,"関東第四G":8,"近畿第二G":10,"関東第一G":6,"関東第二G":7},"2026-04-19":{"関東第三G":20,"関東第五G":13,"北日本G":10,"九州G":10,"東海第一G":8,"近畿第二G":4,"近畿第一G":12,"関東第二G":9,"関東第四G":13,"関東第一G":7,"中四国G":11,"東海第二G":8},"2026-04-20":{"北日本G":5,"関東第一G":5,"中四国G":8,"近畿第一G":9,"東海第二G":5,"九州G":12,"関東第三G":8,"関東第四G":6,"関東第五G":8,"東海第一G":8,"近畿第二G":6,"関東第二G":6},"2026-04-21":{"関東第一G":4,"関東第五G":7,"東海第一G":6,"九州G":9,"近畿第二G":10,"近畿第一G":6,"関東第三G":7,"関東第二G":5,"北日本G":4,"中四国G":6,"東海第二G":7,"関東第四G":7},"2026-04-22":{"中四国G":2,"関東第五G":9,"近畿第一G":3,"近畿第二G":8,"関東第三G":8,"関東第二G":6,"北日本G":4,"東海第一G":6,"九州G":4,"東海第二G":2,"関東第四G":3,"関東第一G":1},"2026-04-23":{"九州G":5,"北日本G":3,"東海第二G":3,"近畿第一G":6,"関東第五G":5,"中四国G":6,"近畿第二G":6,"関東第三G":8,"関東第四G":2,"東海第一G":4,"関東第二G":2,"関東第一G":4},"2026-04-24":{"関東第三G":5,"近畿第一G":7,"近畿第二G":5,"関東第四G":7,"関東第二G":6,"九州G":8,"北日本G":6,"中四国G":13,"関東第五G":7,"東海第一G":1,"関東第一G":3,"東海第二G":1},"2026-04-25":{"関東第二G":9,"中四国G":19,"北日本G":7,"関東第三G":10,"近畿第二G":17,"九州G":18,"関東第五G":12,"関東第一G":9,"近畿第一G":18,"関東第四G":13,"東海第一G":5,"東海第二G":9},"2026-04-26":{"東海第二G":8,"九州G":13,"関東第二G":11,"北日本G":14,"近畿第二G":11,"関東第四G":6,"近畿第一G":19,"中四国G":12,"関東第三G":14,"関東第五G":16,"関東第一G":7,"東海第一G":10},"2026-04-27":{"近畿第一G":5,"東海第二G":8,"近畿第二G":9,"関東第五G":11,"北日本G":5,"関東第二G":3,"九州G":16,"中四国G":5,"関東第四G":7,"関東第三G":4,"東海第一G":2,"関東第一G":1},"2026-04-28":{"中四国G":6,"九州G":6,"関東第四G":6,"近畿第一G":4,"東海第二G":3,"関東第三G":5,"近畿第二G":14,"北日本G":3,"関東第二G":2,"東海第一G":5,"関東第一G":2,"関東第五G":4},"2026-04-29":{"関東第五G":12,"中四国G":6,"関東第四G":9,"東海第一G":10,"北日本G":4,"関東第三G":13,"近畿第二G":13,"九州G":11,"関東第二G":7,"近畿第一G":10,"東海第二G":5,"関東第一G":4},"2026-04-30":{"中四国G":3,"九州G":4,"関東第三G":6,"関東第四G":6,"近畿第二G":9,"北日本G":6,"関東第一G":2,"近畿第一G":5,"関東第二G":5,"東海第一G":5,"関東第五G":5,"東海第二G":1},"2026-05-01":{"九州G":4,"中四国G":9,"関東第二G":6,"東海第一G":3,"近畿第二G":7,"関東第三G":14,"近畿第一G":5,"東海第二G":5,"北日本G":8,"関東第四G":4,"関東第一G":4,"関東第五G":3},"2026-05-02":{"北日本G":11,"関東第五G":8,"関東第四G":14,"近畿第一G":6,"近畿第二G":12,"東海第二G":5,"関東第二G":7,"九州G":20,"関東第一G":6,"中四国G":9,"東海第一G":7,"関東第三G":20},"2026-05-03":{"近畿第一G":9,"関東第一G":4,"九州G":15,"中四国G":11,"北日本G":5,"近畿第二G":13,"関東第四G":13,"関東第三G":17,"関東第五G":7,"東海第一G":3,"東海第二G":5,"関東第二G":4},"2026-05-04":{"関東第三G":6,"中四国G":4,"東海第一G":9,"九州G":15,"近畿第一G":5,"関東第二G":6,"北日本G":7,"関東第一G":4,"関東第五G":5,"近畿第二G":11,"関東第四G":8,"東海第二G":3},"2026-05-05":{"関東第一G":5,"関東第三G":7,"中四国G":8,"近畿第二G":8,"関東第二G":4,"近畿第一G":6,"九州G":5,"関東第五G":8,"北日本G":6,"関東第四G":5,"東海第二G":2,"東海第一G":1},"2026-05-06":{"九州G":9,"北日本G":5,"中四国G":5,"近畿第二G":14,"東海第一G":3,"近畿第一G":8,"関東第四G":9,"関東第三G":11,"関東第二G":6,"東海第二G":11,"関東第五G":5,"関東第一G":6},"2026-05-07":{"九州G":6,"関東第一G":4,"関東第四G":6,"関東第五G":5,"中四国G":4,"近畿第一G":6,"近畿第二G":8,"関東第二G":7,"北日本G":2,"東海第二G":3,"関東第三G":5,"東海第一G":3},"2026-05-08":{"近畿第一G":5,"関東第三G":13,"近畿第二G":11,"九州G":12,"中四国G":6,"関東第二G":7,"関東第五G":7,"北日本G":5,"関東第一G":6,"東海第二G":3,"東海第一G":3,"関東第四G":3},"2026-05-09":{"関東第三G":12,"北日本G":8,"近畿第二G":13,"九州G":10,"中四国G":15,"関東第四G":15,"関東第五G":15,"東海第二G":9,"東海第一G":4,"関東第一G":7,"近畿第一G":10,"関東第二G":7},"2026-05-10":{"九州G":16,"中四国G":8,"近畿第一G":16,"関東第三G":15,"東海第一G":7,"北日本G":14,"関東第五G":10,"関東第四G":17,"東海第二G":14,"関東第二G":10,"近畿第二G":11,"関東第一G":7},"2026-05-11":{"北日本G":5,"中四国G":7,"関東第三G":5,"九州G":14,"東海第二G":7,"関東第五G":7,"近畿第一G":9,"関東第二G":5,"東海第一G":2,"関東第一G":2,"近畿第二G":6,"関東第四G":4},"2026-05-12":{"東海第二G":6,"近畿第二G":10,"関東第一G":4,"北日本G":8,"東海第一G":4,"関東第五G":11,"九州G":14,"中四国G":7,"関東第四G":11,"関東第三G":5,"近畿第一G":5,"関東第二G":2},"2026-05-13":{"関東第二G":7,"近畿第二G":6,"中四国G":2,"近畿第一G":11,"九州G":9,"東海第二G":9,"関東第五G":5,"関東第三G":4,"関東第四G":3,"北日本G":5,"東海第一G":2,"関東第一G":3},"2026-05-14":{"関東第五G":4,"九州G":4,"北日本G":4,"関東第一G":3,"中四国G":3,"関東第四G":7,"関東第三G":8,"近畿第二G":7,"関東第二G":5,"近畿第一G":5,"東海第一G":3,"東海第二G":1},"2026-05-15":{"北日本G":8,"九州G":6,"関東第三G":12,"東海第二G":5,"近畿第一G":12,"近畿第二G":11,"中四国G":9,"関東第四G":5,"関東第二G":4,"東海第一G":3,"関東第五G":3,"関東第一G":2},"2026-05-16":{"関東第四G":16,"中四国G":14,"近畿第二G":10,"九州G":15,"東海第一G":8,"関東第二G":7,"関東第五G":15,"近畿第一G":13,"関東第三G":14,"関東第一G":9,"北日本G":10,"東海第二G":7},"2026-05-17":{"関東第一G":10,"北日本G":10,"近畿第一G":15,"関東第二G":10,"近畿第二G":13,"関東第三G":10,"東海第二G":5,"九州G":11,"関東第四G":6,"中四国G":16,"東海第一G":12,"関東第五G":12},"2026-05-18":{"東海第二G":5,"関東第三G":8,"関東第五G":12,"北日本G":7,"中四国G":10,"近畿第一G":9,"近畿第二G":11,"関東第二G":6,"九州G":16,"関東第四G":6,"関東第一G":3,"東海第一G":7},"2026-05-19":{"九州G":16,"関東第五G":9,"中四国G":4,"関東第三G":13,"東海第一G":6,"北日本G":5,"近畿第二G":6,"近畿第一G":5,"関東第四G":7,"東海第二G":4,"関東第二G":2,"関東第一G":4},"2026-05-20":{"近畿第二G":11,"関東第二G":9,"関東第五G":8,"北日本G":6,"中四国G":5,"九州G":5,"関東第四G":5,"近畿第一G":10,"東海第二G":6,"東海第一G":2,"関東第一G":3,"関東第三G":3},"2026-05-21":{"関東第五G":6,"中四国G":5,"九州G":13,"北日本G":3,"近畿第二G":7,"東海第二G":5,"東海第一G":3,"関東第四G":2,"関東第二G":6,"近畿第一G":3,"関東第一G":4,"関東第三G":3},"2026-05-22":{"東海第一G":4,"北日本G":5,"中四国G":4,"近畿第二G":10,"近畿第一G":10,"九州G":12,"関東第五G":4,"関東第四G":4,"関東第二G":6,"関東第三G":4,"関東第一G":4,"東海第二G":1},"2026-05-23":{"東海第一G":17,"関東第五G":8,"北日本G":7,"関東第四G":11,"関東第二G":16,"関東第三G":20,"九州G":12,"東海第二G":4,"近畿第一G":15,"中四国G":13,"近畿第二G":13,"関東第一G":9},"2026-05-24":{"九州G":20,"北日本G":14,"関東第三G":15,"関東第四G":14,"近畿第二G":12,"関東第二G":10,"関東第一G":7,"中四国G":14,"近畿第一G":11,"関東第五G":10,"東海第二G":10,"東海第一G":10},"2026-05-25":{"中四国G":10,"関東第二G":6,"北日本G":9,"九州G":8,"近畿第二G":8,"関東第三G":9,"関東第四G":10,"関東第五G":9,"東海第二G":8,"近畿第一G":5,"東海第一G":3,"関東第一G":1},"2026-05-26":{"北日本G":8,"中四国G":6,"九州G":9,"近畿第一G":3,"関東第三G":11,"関東第一G":5,"近畿第二G":5,"東海第二G":3,"関東第二G":4,"関東第五G":7,"関東第四G":2,"東海第一G":1},"2026-05-27":{"北日本G":4,"近畿第一G":6,"近畿第二G":5,"関東第五G":8,"関東第一G":4,"中四国G":4,"東海第二G":4,"東海第一G":9,"九州G":4,"関東第三G":3,"関東第四G":3,"関東第二G":1},"2026-05-28":{"北日本G":2,"東海第一G":6,"近畿第一G":4,"関東第五G":5,"近畿第二G":4,"九州G":6,"関東第三G":9,"中四国G":7,"関東第四G":3,"東海第二G":5,"関東第二G":3,"関東第一G":3},"2026-05-29":{"近畿第二G":11,"九州G":17,"関東第五G":6,"北日本G":11,"関東第四G":6,"関東第三G":6,"中四国G":5,"関東第二G":7,"東海第二G":3,"近畿第一G":7,"東海第一G":3,"関東第一G":1},"2026-05-30":{"関東第五G":13,"関東第一G":6,"北日本G":7,"中四国G":16,"東海第一G":4,"九州G":9,"関東第三G":12,"近畿第二G":12,"関東第四G":10,"東海第二G":8,"近畿第一G":10,"関東第二G":5},"2026-05-31":{"近畿第二G":14,"北日本G":8,"東海第二G":10,"関東第三G":11,"関東第二G":6,"九州G":14,"関東第一G":9,"関東第四G":14,"東海第一G":9,"中四国G":10,"近畿第一G":6,"関東第五G":14},"2026-06-01":{"近畿第二G":15,"関東第四G":8,"関東第二G":4,"中四国G":9,"九州G":6,"関東第三G":9,"北日本G":4,"東海第二G":8,"関東第五G":2,"関東第一G":5,"近畿第一G":6,"東海第一G":2},"2026-06-02":{"北日本G":8,"関東第四G":9,"東海第二G":5,"関東第三G":6,"九州G":6,"中四国G":9,"関東第五G":5,"関東第二G":4,"関東第一G":5,"近畿第一G":4,"近畿第二G":6,"東海第一G":2},"2026-06-03":{"北日本G":2,"関東第三G":6,"中四国G":6,"関東第五G":3,"近畿第一G":6,"関東第四G":7,"九州G":2,"近畿第二G":5,"東海第二G":5,"関東第二G":1,"東海第一G":3,"関東第一G":1},"2026-06-04":{"中四国G":3,"関東第四G":3,"北日本G":3,"関東第五G":11,"関東第三G":10,"九州G":2,"東海第二G":3,"近畿第一G":5,"近畿第二G":6,"関東第二G":2,"東海第一G":3},"2026-06-05":{"近畿第二G":3,"関東第三G":11,"関東第四G":10,"関東第二G":3,"中四国G":5,"九州G":5,"関東第五G":5,"関東第一G":2,"北日本G":3,"近畿第一G":8,"東海第二G":4,"東海第一G":1},"2026-06-06":{"近畿第二G":12,"北日本G":12,"九州G":4,"関東第四G":12,"中四国G":13,"近畿第一G":9,"関東第三G":15,"関東第一G":9,"東海第一G":4,"関東第五G":17,"関東第二G":9,"東海第二G":8},"2026-06-07":{"近畿第一G":17,"近畿第二G":7,"関東第四G":11,"北日本G":20,"関東第二G":7,"中四国G":8,"九州G":12,"関東第五G":10,"東海第二G":7,"関東第三G":15,"関東第一G":2,"東海第一G":5},"2026-06-08":{"関東第五G":10,"関東第三G":6,"関東第二G":4,"九州G":4,"中四国G":6,"近畿第二G":8,"東海第二G":6,"関東第一G":1,"北日本G":6,"近畿第一G":7,"東海第一G":2,"関東第四G":2},"2026-06-09":{"北日本G":1,"関東第三G":5,"関東第五G":5,"中四国G":11,"九州G":7,"関東第四G":6,"近畿第一G":4,"関東第二G":2,"近畿第二G":8,"東海第二G":5,"東海第一G":3,"関東第一G":4},"2026-06-10":{"関東第三G":11,"関東第一G":2,"関東第四G":5,"中四国G":5,"九州G":5,"近畿第一G":5,"東海第二G":2,"近畿第二G":4,"東海第一G":2,"北日本G":3,"関東第五G":3,"関東第二G":4},"2026-06-11":{"九州G":3,"北日本G":9,"関東第三G":8,"東海第二G":1,"近畿第一G":7,"近畿第二G":6,"関東第四G":9,"関東第一G":1,"関東第二G":1,"中四国G":1,"関東第五G":2,"東海第一G":2},"2026-06-12":{"九州G":4,"北日本G":2,"近畿第一G":7,"関東第三G":4,"関東第四G":8,"中四国G":4,"関東第一G":2,"近畿第二G":8,"関東第五G":4,"関東第二G":3,"東海第二G":3,"東海第一G":2}};
+const DAILY_LINE_DEF={"2026-06-13":{"近畿第二G":1,"九州G":1,"関東第五G":1,"北日本G":1},"2026-06-12":{"関東第三G":1,"中四国G":1,"関東第五G":1,"関東第一G":2,"近畿第二G":1},"2026-06-11":{"九州G":1,"関東第四G":2,"関東第三G":1},"2026-06-10":{"中四国G":2,"九州G":3,"関東第一G":1,"東海第一G":1,"近畿第一G":1,"関東第三G":1,"関東第四G":1},"2026-06-09":{"九州G":5,"関東第一G":1,"関東第四G":4,"東海第二G":2,"関東第五G":2,"関東第二G":2,"近畿第二G":1,"東海第一G":1},"2026-06-08":{"近畿第二G":1,"関東第二G":1,"九州G":4,"北日本G":1,"関東第五G":2,"関東第四G":1,"関東第三G":2},"2026-06-07":{"九州G":2,"関東第五G":3,"北日本G":3,"近畿第一G":1,"中四国G":3,"関東第一G":1,"関東第二G":1,"東海第一G":1,"関東第三G":1,"近畿第二G":1},"2026-06-06":{"九州G":8,"関東第二G":3,"関東第三G":5,"中四国G":4,"東海第一G":4,"近畿第一G":1,"北日本G":2,"関東第四G":2,"関東第五G":2,"東海第二G":1,"近畿第二G":2},"2026-06-05":{"九州G":2,"中四国G":1,"北日本G":1,"東海第一G":1,"関東第三G":1},"2026-06-04":{"東海第一G":1,"近畿第一G":2,"関東第五G":1,"中四国G":1,"関東第三G":1,"東海第二G":1},"2026-06-03":{"関東第三G":3,"近畿第二G":1,"関東第四G":2,"九州G":2,"東海第二G":3,"東海第一G":1,"関東第一G":1,"近畿第一G":1,"中四国G":1},"2026-06-02":{"関東第三G":4,"北日本G":3,"近畿第二G":2,"関東第一G":2,"東海第二G":1,"関東第二G":1},"2026-06-01":{"関東第三G":2,"関東第四G":3,"東海第二G":1,"中四国G":1,"近畿第二G":1},"2026-05-31":{"九州G":5,"関東第三G":2,"中四国G":4,"東海第一G":3,"関東第二G":1,"関東第五G":1,"関東第四G":3,"近畿第二G":2,"東海第二G":1,"関東第一G":1},"2026-05-30":{"九州G":3,"東海第二G":2,"中四国G":4,"近畿第二G":1,"近畿第一G":1,"関東第二G":2,"関東第五G":3,"関東第三G":2,"北日本G":2,"関東第四G":1},"2026-05-29":{"九州G":6,"北日本G":3,"関東第二G":1,"関東第五G":1,"関東第四G":1,"関東第三G":1,"中四国G":1,"東海第二G":1},"2026-05-28":{"関東第五G":1,"関東第一G":4,"近畿第一G":1,"東海第二G":1,"関東第二G":1},"2026-05-27":{"関東第五G":1,"関東第一G":1,"北日本G":2,"関東第三G":2,"東海第一G":2,"中四国G":1,"関東第二G":1},"2026-05-26":{"関東第三G":1,"東海第一G":1,"九州G":3,"関東第五G":2,"関東第四G":1,"北日本G":1},"2026-05-25":{"関東第三G":3,"東海第二G":3,"九州G":4,"近畿第一G":1,"関東第二G":2,"東海第一G":1,"関東第四G":2,"中四国G":2,"関東第五G":1},"2026-05-24":{"九州G":12,"関東第四G":3,"東海第二G":2,"関東第五G":1,"関東第二G":3,"関東第三G":1,"近畿第二G":2,"東海第一G":2,"北日本G":3,"関東第一G":1},"2026-05-23":{"中四国G":3,"九州G":8,"北日本G":2,"関東第二G":3,"関東第一G":3,"関東第四G":2,"関東第三G":1,"東海第一G":6,"近畿第一G":2,"関東第五G":2,"近畿第二G":2},"2026-05-22":{"関東第一G":3,"関東第二G":1,"九州G":4,"北日本G":1,"関東第五G":2,"近畿第一G":1,"関東第三G":1},"2026-05-21":{"九州G":5,"近畿第一G":2,"関東第一G":3,"東海第二G":1,"関東第五G":2,"関東第二G":1,"東海第一G":1,"関東第四G":1},"2026-05-20":{"関東第二G":3,"北日本G":4,"東海第二G":3,"関東第五G":1,"近畿第二G":2,"中四国G":1,"関東第三G":1,"関東第四G":2},"2026-05-19":{"関東第四G":2,"関東第一G":2,"九州G":4,"北日本G":1,"関東第五G":2,"東海第一G":1,"関東第三G":1},"2026-05-18":{"関東第三G":2,"関東第五G":7,"九州G":9,"関東第二G":2,"関東第四G":4,"中四国G":3,"東海第二G":1,"近畿第二G":1,"東海第一G":4,"関東第一G":2,"近畿第一G":1},"2026-05-17":{"関東第四G":2,"関東第二G":3,"関東第五G":2,"関東第三G":3,"九州G":4,"北日本G":3,"近畿第二G":3,"近畿第一G":1,"中四国G":1,"関東第一G":2,"東海第二G":1,"東海第一G":1},"2026-05-16":{"九州G":4,"中四国G":3,"関東第四G":3,"関東第一G":2,"関東第五G":3,"関東第二G":1,"近畿第一G":3,"関東第三G":4,"東海第一G":1,"北日本G":1,"東海第二G":3},"2026-05-15":{"関東第五G":3,"近畿第一G":3,"関東第三G":3,"関東第四G":4,"近畿第二G":3,"関東第二G":2,"九州G":2,"東海第二G":1},"2026-05-14":{"関東第二G":2,"近畿第一G":1,"関東第四G":2,"関東第一G":1,"近畿第二G":1,"関東第三G":1},"2026-05-13":{"九州G":6,"北日本G":3,"関東第五G":4,"関東第一G":2,"関東第四G":2,"東海第二G":3,"中四国G":1,"東海第一G":1,"関東第三G":2},"2026-05-12":{"近畿第二G":3,"関東第四G":3,"東海第一G":2,"東海第二G":2,"関東第五G":2,"九州G":4},"2026-05-11":{"九州G":4,"関東第四G":3,"関東第五G":4,"近畿第二G":3,"北日本G":3,"関東第二G":1,"東海第二G":2,"中四国G":3,"関東第三G":1},"2026-05-10":{"関東第四G":6,"東海第二G":5,"関東第五G":4,"関東第二G":6,"九州G":11,"関東第三G":3,"北日本G":2,"近畿第二G":3,"中四国G":1,"関東第一G":1},"2026-05-09":{"関東第五G":9,"九州G":6,"中四国G":3,"関東第二G":2,"近畿第二G":2,"関東第四G":4,"東海第二G":2,"北日本G":2,"東海第一G":1,"近畿第一G":1},"2026-05-08":{"中四国G":1,"関東第五G":5,"関東第二G":1,"東海第二G":1,"関東第四G":1,"北日本G":1,"九州G":1,"関東第三G":1,"近畿第二G":1},"2026-05-07":{"九州G":3,"関東第五G":4,"中四国G":2,"関東第四G":2,"関東第二G":1,"東海第一G":1,"北日本G":2,"関東第三G":1,"関東第一G":1},"2026-05-06":{"東海第二G":5,"北日本G":5,"近畿第二G":4,"中四国G":2,"関東第五G":3,"九州G":3,"関東第二G":3,"東海第一G":1,"関東第四G":3},"2026-05-05":{"近畿第二G":2,"関東第二G":3,"関東第四G":2,"関東第五G":3,"九州G":1,"東海第一G":2,"東海第二G":2,"中四国G":2},"2026-05-04":{"九州G":4,"近畿第二G":3,"関東第四G":2,"関東第五G":4,"東海第一G":3,"中四国G":1,"関東第二G":1},"2026-05-03":{"九州G":7,"中四国G":5,"近畿第二G":2,"関東第四G":4,"東海第二G":2,"北日本G":1,"関東第五G":2,"関東第三G":1,"東海第一G":1},"2026-05-02":{"関東第三G":5,"中四国G":3,"九州G":9,"関東第二G":4,"関東第五G":3,"関東第四G":3,"近畿第二G":4,"近畿第一G":1,"東海第二G":1,"東海第一G":1},"2026-05-01":{"関東第四G":3,"関東第三G":3,"中四国G":2,"関東第一G":1,"九州G":1,"関東第二G":3,"近畿第二G":1,"東海第二G":1},"2026-04-30":{"関東第四G":2,"関東第五G":1,"中四国G":1,"九州G":2,"東海第一G":2,"近畿第一G":1,"関東第三G":1,"近畿第二G":1},"2026-04-29":{"東海第一G":3,"関東第二G":4,"関東第五G":9,"近畿第二G":3,"九州G":1,"中四国G":1,"関東第三G":2,"関東第四G":3},"2026-04-28":{"近畿第二G":7,"東海第二G":1,"関東第五G":3,"九州G":2,"近畿第一G":2,"東海第一G":1,"北日本G":1,"関東第四G":1,"中四国G":1},"2026-04-27":{"九州G":7,"近畿第二G":4,"関東第五G":6,"東海第一G":1,"関東第三G":1,"東海第二G":2,"中四国G":3,"関東第四G":1},"2026-04-26":{"中四国G":2,"東海第一G":3,"関東第二G":4,"関東第五G":10,"関東第四G":4,"九州G":3,"東海第二G":2,"近畿第二G":2,"関東第三G":4},"2026-04-25":{"九州G":4,"近畿第二G":8,"関東第四G":4,"関東第五G":6,"近畿第一G":2,"関東第三G":2,"関東第二G":1,"中四国G":5,"関東第一G":1,"東海第二G":1,"北日本G":1},"2026-04-24":{"関東第五G":4,"中四国G":1,"近畿第二G":4,"関東第四G":1,"関東第三G":1,"近畿第一G":1},"2026-04-23":{"九州G":2,"関東第三G":2,"東海第二G":2,"関東第四G":1,"中四国G":1,"近畿第一G":1,"関東第五G":1,"関東第二G":1,"近畿第二G":1},"2026-04-22":{"関東第五G":3,"東海第一G":2,"近畿第二G":1,"関東第三G":2,"関東第四G":1,"中四国G":1},"2026-04-21":{"関東第四G":4,"九州G":1,"関東第五G":3,"東海第二G":1,"東海第一G":3,"関東第三G":1,"関東第一G":1,"中四国G":1},"2026-04-20":{"東海第一G":2,"東海第二G":1,"関東第一G":1,"関東第三G":1,"関東第五G":4,"九州G":4,"北日本G":1},"2026-04-19":{"中四国G":3,"関東第一G":4,"関東第五G":5,"九州G":4,"東海第二G":2,"東海第一G":1,"近畿第二G":1},"2026-04-18":{"関東第五G":4,"近畿第一G":2,"九州G":5,"北日本G":1,"中四国G":3,"東海第二G":1,"関東第四G":1,"関東第一G":1,"東海第一G":1},"2026-04-17":{"関東第一G":2,"関東第五G":3,"九州G":2,"近畿第二G":1,"北日本G":1},"2026-04-16":{"関東第五G":2,"九州G":1,"関東第三G":3,"東海第一G":1,"近畿第二G":1},"2026-04-15":{"中四国G":1,"九州G":1,"関東第一G":1,"関東第五G":1},"2026-04-14":{"東海第二G":1},"2026-04-11":{"東海第一G":1},"2026-04-02":{"東海第一G":1}};
+
+const MONTHLY_LINE_DEF={"2026-06":{"近畿第二G":11,"九州G":28,"関東第五G":12,"北日本G":11,"関東第三G":22,"中四国G":14,"関東第一G":8,"関東第四G":15,"東海第一G":10,"近畿第一G":6,"東海第二G":9,"関東第二G":8},"2026-05":{"九州G":133,"関東第三G":46,"中四国G":49,"東海第一G":36,"関東第二G":54,"関東第五G":82,"関東第四G":71,"近畿第二G":45,"東海第二G":46,"関東第一G":30,"近畿第一G":19,"北日本G":42},"2026-04":{"関東第四G":23,"関東第五G":65,"中四国G":24,"九州G":39,"東海第一G":22,"近畿第一G":9,"関東第三G":20,"近畿第二G":34,"関東第二G":10,"東海第二G":14,"北日本G":5,"関東第一G":11}};
+
+Chart.register(ChartDataLabels);
+
+const GROUPS=["北日本G","関東第一G","関東第二G","関東第三G","関東第四G","関東第五G","東海第一G","東海第二G","近畿第一G","近畿第二G","中四国G","九州G"];
+const G12=new Set(GROUPS);
+// グループ名の正規化（全角→半角、空白除去）で表記ゆれに対応
+function normGroup(s){
+  return String(s)
+    .replace(/[\uff01-\uff5e]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xfee0))
+    .replace(/[\s\u3000]/g,'');
+}
+const G12_NORM={};
+GROUPS.forEach(g=>{G12_NORM[normGroup(g)]=g;});
+
+let DAILY_FUSEI=JSON.parse(JSON.stringify(DAILY_FUSEI_DEF));
+let DAILY_LINE=JSON.parse(JSON.stringify(DAILY_LINE_DEF));
+let MONTHLY_LINE=JSON.parse(JSON.stringify(MONTHLY_LINE_DEF));
+
+function mlabel(ym){return`${parseInt(ym.split('-')[1])}月`;}
+function lineMonths(){return Object.keys(MONTHLY_LINE).sort();}
+function currM(){const m=lineMonths();return m[m.length-1]||null;}
+function prevM(){const m=lineMonths();return m.length>=2?m[m.length-2]:null;}
+
+function monthlyFusei(){
+  const out={};
+  for(const[d,gs]of Object.entries(DAILY_FUSEI)){
+    const ym=d.slice(0,7);
+    if(!out[ym])out[ym]={};
+    for(const[g,c]of Object.entries(gs))out[ym][g]=(out[ym][g]||0)+c;
+  }
+  return out;
+}
+
+function lineCount(g,m){return(MONTHLY_LINE[m]||{})[g]||0;}
+function fuseiCount(g,m){const mf=monthlyFusei();return(mf[m]||{})[g]||0;}
+function rate(g,m){const f=fuseiCount(g,m),l=lineCount(g,m);return f>0?l/f*100:0;}
+function rateColor(r){if(r>=30)return'#0F6E56';if(r>=20)return'#1D9E75';if(r>=10)return'#5DCAA5';return'#bbb';}
+
+function dailyDates(){
+  const all=Object.keys(DAILY_FUSEI).sort();
+  return currentMonth ? all.filter(d=>d.startsWith(currentMonth)) : all;
+}
+function dailyFusei(g){
+  return dailyDates().map(d=>{
+    if(g==='ALL')return Object.values(DAILY_FUSEI[d]||{}).reduce((a,b)=>a+b,0);
+    return(DAILY_FUSEI[d]||{})[g]||0;
+  });
+}
+function dailyLine(g){
+  return dailyDates().map(d=>{
+    if(g==='ALL')return Object.values(DAILY_LINE[d]||{}).reduce((a,b)=>a+b,0);
+    return(DAILY_LINE[d]||{})[g]||0;
+  });
+}
+
+let rateSortM='curr', currentGroup='ALL', currentMonth='', monthGrp='ALL';
+let rateChart, dailyChart, scatterChart, monthlyChart;
+
+function buildKPI(){
+  const curr=currM(), prev=prevM(), mf=monthlyFusei();
+  const fc=curr?Object.values(mf[curr]||{}).reduce((a,b)=>a+b,0):0;
+  const lc=curr?Object.values(MONTHLY_LINE[curr]||{}).reduce((a,b)=>a+b,0):0;
+  const rc=fc>0?lc/fc*100:0;
+  const fp=prev?Object.values(mf[prev]||{}).reduce((a,b)=>a+b,0):0;
+  const lp=prev?Object.values(MONTHLY_LINE[prev]||{}).reduce((a,b)=>a+b,0):0;
+  const rp=fp>0?lp/fp*100:0;
+  const delta=rc-rp;
+  const total=Object.values(MONTHLY_LINE).reduce((a,mo)=>a+Object.values(mo).reduce((x,y)=>x+y,0),0);
+  const cl=curr?mlabel(curr):'-', pl=prev?mlabel(prev):'-';
+  document.getElementById('kpi-grid').innerHTML=`
+    <div class="kpi"><div class="kpi-lbl">${pl} 登録率</div><div class="kpi-val">${rp.toFixed(1)}%</div><div class="kpi-sub">${lp.toLocaleString()} / ${fp.toLocaleString()}件</div></div>
+    <div class="kpi hl"><div class="kpi-lbl">${cl} 登録率</div><div class="kpi-val" style="color:#1D9E75">${rc.toFixed(1)}%</div><div class="kpi-sub">${lc.toLocaleString()} / ${fc.toLocaleString()}件</div></div>
+    <div class="kpi"><div class="kpi-lbl">前月比</div><div class="kpi-val" style="color:${delta>=0?'#1D9E75':'#D85A30'}">${delta>=0?'+':''}${delta.toFixed(1)}</div><div class="kpi-sub">${pl} → ${cl}（pp）</div></div>
+    <div class="kpi"><div class="kpi-lbl">累計LINE登録</div><div class="kpi-val">${total.toLocaleString()}件</div><div class="kpi-sub">${lineMonths().map(m=>mlabel(m)).join('・')}合計</div></div>`;
+}
+
+function buildRateChart(){
+  const curr=currM(), prev=prevM();
+  if(!curr)return;
+  const sm=rateSortM==='curr'?curr:(prev||curr);
+  const sg=[...GROUPS].sort((a,b)=>rate(b,sm)-rate(a,sm));
+  const datasets=[];
+  if(prev)datasets.push({
+    label:mlabel(prev),
+    data:sg.map(g=>parseFloat(rate(g,prev).toFixed(1))),
+    backgroundColor:'rgba(180,178,169,0.7)',
+    borderWidth:0,borderRadius:2,
+    datalabels:{color:'#999',font:{size:12},formatter:v=>v>0?v.toFixed(1)+'%':'',anchor:'end',align:'end',offset:3}
+  });
+  datasets.push({
+    label:mlabel(curr),
+    data:sg.map(g=>parseFloat(rate(g,curr).toFixed(1))),
+    backgroundColor:'#1D9E75',
+    borderWidth:0,borderRadius:2,
+    datalabels:{color:'#0a5740',font:{size:13,weight:'bold'},formatter:v=>v>0?v.toFixed(1)+'%':'',anchor:'end',align:'end',offset:3}
+  });
+  if(rateChart)rateChart.destroy();
+  rateChart=new Chart(document.getElementById('rateChart'),{
+    type:'bar',data:{labels:sg,datasets},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      layout:{padding:{right:48}},
+      plugins:{
+        legend:{display:false},
+        datalabels:{display:true},
+        tooltip:{callbacks:{label:c=>{
+          const g=sg[c.dataIndex],m=(prev&&c.datasetIndex===0)?prev:curr,lb=mlabel(m);
+          return`${lb}: ${c.parsed.x.toFixed(1)}%（LINE ${lineCount(g,m)}件 / 不成立 ${fuseiCount(g,m)}件）`;
+        }}}
+      },
+      scales:{
+        x:{min:0,max:52,grid:{color:'rgba(0,0,0,0.04)'},ticks:{callback:v=>v+'%',color:'#888',font:{size:13}},border:{display:false}},
+        y:{grid:{display:false},ticks:{color:'#444',font:{size:13}},border:{display:false}}
+      }
+    }
+  });
+  const pl=prev?mlabel(prev):'';
+  document.getElementById('sort-prev').textContent=pl;
+  document.getElementById('sort-curr').textContent=mlabel(curr);
+  document.getElementById('sort-prev').className='sort-btn'+(rateSortM==='prev'?' active':'');
+  document.getElementById('sort-curr').className='sort-btn'+(rateSortM==='curr'?' active':'');
+  document.getElementById('sort-prev').style.display=prev?'':'none';
+  document.getElementById('leg-prev').textContent=pl;
+  document.getElementById('leg-curr').textContent=mlabel(curr);
+  document.getElementById('th-prev').textContent=pl;
+  document.getElementById('th-curr').textContent=mlabel(curr);
+  document.getElementById('rate-ttl').textContent=prev?`グループ別 LINE登録率（${pl} vs ${mlabel(curr)}）`:'グループ別 LINE登録率';
+}
+
+function buildDailyChart(){
+  const dates=dailyDates();
+  const fData=dailyFusei(currentGroup);
+  const lData=dailyLine(currentGroup);
+  const isApr=currentMonth==='2026-04';
+  const barColor=isApr?'rgba(180,178,169,0.65)':'rgba(216,90,48,0.5)';
+  const dot=document.getElementById('daily-bar-dot');
+  if(dot)dot.style.background=barColor;
+  if(dailyChart)dailyChart.destroy();
+  dailyChart=new Chart(document.getElementById('dailyChart'),{
+    data:{
+      labels:dates.map(d=>d.slice(5).replace('-','/')),
+      datasets:[
+        {type:'bar',label:'不成立',data:fData,backgroundColor:barColor,yAxisID:'y',order:2,
+          datalabels:{display:false}},
+        {type:'line',label:'LINE登録',data:lData,borderColor:'#1D9E75',backgroundColor:'transparent',
+          pointBackgroundColor:'#1D9E75',pointRadius:3.5,pointHoverRadius:5,
+          borderWidth:2.5,spanGaps:true,yAxisID:'y2',order:1,
+          datalabels:{display:false}}
+      ]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{
+        legend:{display:false},
+        datalabels:{display:false},
+        tooltip:{callbacks:{label:c=>c.dataset.yAxisID==='y2'?`LINE登録: ${c.parsed.y}件`:`不成立: ${c.parsed.y}件`}}
+      },
+      scales:{
+        x:{grid:{display:false},ticks:{color:'#888',font:{size:11},maxRotation:45,autoSkip:true,maxTicksLimit:31},border:{display:false}},
+        y:{min:0,position:'left',grid:{color:'rgba(0,0,0,0.04)'},ticks:{color:'#888',font:{size:12}},border:{display:false}},
+        y2:{min:0,position:'right',grid:{display:false},ticks:{color:'#1D9E75',font:{size:12}},border:{display:false}}
+      }
+    }
+  });
+}
+
+function buildTable(){
+  const curr=currM(),prev=prevM();
+  if(!curr)return;
+  const sm=rateSortM==='curr'?curr:(prev||curr);
+  const sg=[...GROUPS].sort((a,b)=>rate(b,sm)-rate(a,sm));
+  const mf=monthlyFusei();
+  document.getElementById('tbl-body').innerHTML=sg.map(g=>{
+    const f4=(mf[prev||'']||{})[g]||0,l4=lineCount(g,prev||''),r4=prev?rate(g,prev):0;
+    const f5=(mf[curr]||{})[g]||0,l5=lineCount(g,curr),r5=rate(g,curr);
+    const delta=r5-r4;
+    return`<tr><td>${g}</td>
+      <td class="bl">${f4.toLocaleString()}</td><td>${l4}</td><td style="font-weight:600;color:${rateColor(r4)}">${r4.toFixed(1)}%</td>
+      <td class="bl">${f5.toLocaleString()}</td><td>${l5}</td><td style="font-weight:600;color:${rateColor(r5)}">${r5.toFixed(1)}%</td>
+      <td class="bl" style="font-weight:600;color:${delta>=0?'#1D9E75':'#D85A30'}">${delta>=0?'+':''}${delta.toFixed(1)}</td></tr>`;
+  }).join('');
+  const mf2=mf;
+  const f4t=Object.values(mf2[prev||'']||{}).reduce((a,b)=>a+b,0);
+  const l4t=Object.values(MONTHLY_LINE[prev||'']||{}).reduce((a,b)=>a+b,0);
+  const r4t=f4t>0?l4t/f4t*100:0;
+  const f5t=Object.values(mf2[curr]||{}).reduce((a,b)=>a+b,0);
+  const l5t=Object.values(MONTHLY_LINE[curr]||{}).reduce((a,b)=>a+b,0);
+  const r5t=f5t>0?l5t/f5t*100:0;
+  const dt=r5t-r4t;
+  document.getElementById('tbl-foot').innerHTML=`<td>合計</td>
+    <td class="bl">${f4t.toLocaleString()}</td><td>${l4t}</td><td style="font-weight:600">${r4t.toFixed(1)}%</td>
+    <td class="bl">${f5t.toLocaleString()}</td><td>${l5t}</td><td style="font-weight:600;color:#1D9E75">${r5t.toFixed(1)}%</td>
+    <td class="bl" style="font-weight:600;color:${dt>=0?'#1D9E75':'#D85A30'}">${dt>=0?'+':''}${dt.toFixed(1)}</td>`;
+}
+
+function buildMonthSel(){
+  const months=[...new Set(Object.keys(DAILY_FUSEI).map(d=>d.slice(0,7)))].sort();
+  const sel=document.getElementById('month-sel');
+  sel.innerHTML=months.map(m=>`<option value="${m}">${mlabel(m)}</option>`).join('');
+  if(!currentMonth||!months.includes(currentMonth)){
+    currentMonth=months[months.length-1]||'';
+  }
+  sel.value=currentMonth;
+}
+
+function buildGroupSel(){
+  buildMonthSel();
+  const sel=document.getElementById('grp-sel');
+  sel.innerHTML='<option value="ALL">全体</option>'+GROUPS.map(g=>`<option value="${g}">${g}</option>`).join('');
+  sel.value=currentGroup;
+}
+
+function setGroup(g){currentGroup=g;buildDailyChart();}
+function setMonth(m){currentMonth=m;buildDailyChart();}
+function setRateSort(m){rateSortM=m;buildRateChart();buildTable();}
+
+function buildScatterChart(){
+  const curr=currM();
+  if(!curr)return;
+  const xData=GROUPS.map(g=>fuseiCount(g,curr));
+  const yData=GROUPS.map(g=>parseFloat(rate(g,curr).toFixed(1)));
+  const avgX=xData.reduce((a,b)=>a+b,0)/xData.length;
+  const avgY=yData.reduce((a,b)=>a+b,0)/yData.length;
+  const maxX=Math.max(...xData), maxY=Math.max(...yData);
+  const xMax=Math.ceil(maxX*1.12/10)*10, yMax=Math.ceil(maxY*1.25/5)*5;
+  const ptColors=GROUPS.map((_,i)=>{
+    const x=xData[i],y=yData[i];
+    if(x>=avgX&&y>=avgY)return'#1D9E75';
+    if(x>=avgX&&y<avgY)return'#D85A30';
+    if(x<avgX&&y>=avgY)return'#378ADD';
+    return'#B4B2A9';
+  });
+  if(scatterChart)scatterChart.destroy();
+  scatterChart=new Chart(document.getElementById('scatterChart'),{
+    type:'scatter',
+    data:{datasets:[
+      {
+        label:'グループ',
+        data:GROUPS.map((_,i)=>({x:xData[i],y:yData[i]})),
+        backgroundColor:ptColors,
+        pointRadius:9,pointHoverRadius:11,
+        datalabels:{
+          display:true,
+          formatter:(_,ctx)=>GROUPS[ctx.dataIndex].replace('G',''),
+          color:'#333',font:{size:10},
+          anchor:'end',align:'top',offset:2,clamp:true
+        }
+      },
+      {
+        type:'line',label:'avgX',
+        data:[{x:avgX,y:0},{x:avgX,y:yMax}],
+        borderColor:'rgba(0,0,0,0.18)',borderWidth:1.5,
+        borderDash:[5,4],pointRadius:0,fill:false,
+        datalabels:{display:false}
+      },
+      {
+        type:'line',label:'avgY',
+        data:[{x:0,y:avgY},{x:xMax,y:avgY}],
+        borderColor:'rgba(0,0,0,0.18)',borderWidth:1.5,
+        borderDash:[5,4],pointRadius:0,fill:false,
+        datalabels:{display:false}
+      }
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      layout:{padding:{top:16,right:16}},
+      plugins:{
+        legend:{display:false},
+        datalabels:{display:false},
+        tooltip:{callbacks:{label:ctx=>{
+          if(ctx.datasetIndex>0)return null;
+          const g=GROUPS[ctx.dataIndex];
+          return`${g}：不成立${ctx.parsed.x}件 / 登録率${ctx.parsed.y.toFixed(1)}%`;
+        }}}
+      },
+      scales:{
+        x:{min:0,max:xMax,
+          title:{display:true,text:'不成立件数（件）',font:{size:11},color:'#888'},
+          grid:{color:'rgba(0,0,0,0.04)'},
+          ticks:{color:'#888',font:{size:11}},border:{display:false}},
+        y:{min:0,max:yMax,
+          title:{display:true,text:'登録率（%）',font:{size:11},color:'#888'},
+          ticks:{callback:v=>v+'%',color:'#888',font:{size:11}},
+          grid:{color:'rgba(0,0,0,0.04)'},border:{display:false}}
+      }
+    }
+  });
+  const el=document.getElementById('scatter-month');
+  if(el)el.textContent=mlabel(curr);
+}
+
+function buildMonthGrpSel(){
+  const sel=document.getElementById('mo-grp-sel');
+  sel.innerHTML='<option value="ALL">全体</option>'+GROUPS.map(g=>`<option value="${g}">${g}</option>`).join('');
+  sel.value=monthGrp;
+}
+
+function setMonthGrp(g){monthGrp=g;buildMonthlyChart();}
+
+function buildMonthlyChart(){
+  const mf=monthlyFusei();
+  const months=Object.keys(mf).filter(m=>m>='2026-04').sort();
+  const fData=months.map(m=>{
+    if(monthGrp==='ALL')return Object.values(mf[m]||{}).reduce((a,b)=>a+b,0);
+    return(mf[m]||{})[monthGrp]||0;
+  });
+  const lData=months.map(m=>{
+    if(monthGrp==='ALL')return Object.values(MONTHLY_LINE[m]||{}).reduce((a,b)=>a+b,0);
+    return(MONTHLY_LINE[m]||{})[monthGrp]||0;
+  });
+  if(monthlyChart)monthlyChart.destroy();
+  monthlyChart=new Chart(document.getElementById('monthlyChart'),{
+    data:{
+      labels:months.map(m=>mlabel(m)),
+      datasets:[
+        {type:'bar',label:'不成立',data:fData,backgroundColor:'rgba(216,90,48,0.5)',
+          yAxisID:'y',order:2,datalabels:{display:false}},
+        {type:'line',label:'LINE登録',data:lData,borderColor:'#1D9E75',
+          backgroundColor:'transparent',pointBackgroundColor:'#1D9E75',
+          pointRadius:6,pointHoverRadius:8,borderWidth:2.5,
+          yAxisID:'y2',order:1,datalabels:{display:false}}
+      ]
+    },
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{
+        legend:{display:false},
+        datalabels:{display:false},
+        tooltip:{callbacks:{label:c=>c.dataset.yAxisID==='y2'?`LINE登録: ${c.parsed.y}件`:`不成立: ${c.parsed.y}件`}}
+      },
+      scales:{
+        x:{grid:{display:false},ticks:{color:'#888',font:{size:13}},border:{display:false}},
+        y:{min:0,position:'left',grid:{color:'rgba(0,0,0,0.04)'},ticks:{color:'#888',font:{size:11}},border:{display:false}},
+        y2:{min:0,position:'right',grid:{display:false},ticks:{color:'#1D9E75',font:{size:11}},border:{display:false}}
+      }
+    }
+  });
+}
+
+function rebuildAll(){buildKPI();buildRateChart();buildGroupSel();buildMonthGrpSel();buildMonthlyChart();buildDailyChart();buildTable();buildScatterChart();}
+
+function saveAsHTML(){
+  const st=document.getElementById('save-st');
+  try{
+    // 現在のHTML全体を取得（DOCTYPE付与）
+    let html=document.documentElement.outerHTML;
+
+    // 埋め込みデータを最新に書き換え（置換関数で$解釈を回避）
+    html=html.replace(/const DAILY_FUSEI_DEF=\{[\s\S]*?\};/, ()=>'const DAILY_FUSEI_DEF='+JSON.stringify(DAILY_FUSEI)+';');
+    html=html.replace(/const DAILY_LINE_DEF=\{[\s\S]*?\};/, ()=>'const DAILY_LINE_DEF='+JSON.stringify(DAILY_LINE)+';');
+    html=html.replace(/const MONTHLY_LINE_DEF=\{[\s\S]*?\};/, ()=>'const MONTHLY_LINE_DEF='+JSON.stringify(MONTHLY_LINE)+';');
+
+    html='<!DOCTYPE html>\n'+html;
+
+    const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+    const now=new Date();
+    const ts=`${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download=`不成立LINE登録率ダッシュボード_${ts}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+    st.textContent=`保存完了 (${ts})`;
+    st.className='upload-st ok';
+  }catch(err){
+    st.textContent='エラー: '+err.message;
+    st.className='upload-st err';
+  }
+}
+
+function excelDateStr(v){
+  if(v instanceof Date){
+    const y=v.getFullYear(),mo=String(v.getMonth()+1).padStart(2,'0'),d=String(v.getDate()).padStart(2,'0');
+    return`${y}-${mo}-${d}`;
+  }
+  if(typeof v==='number'){
+    const dt=new Date(Math.round((v-25569)*864e5));
+    const y=dt.getUTCFullYear(),mo=String(dt.getUTCMonth()+1).padStart(2,'0'),d=String(dt.getUTCDate()).padStart(2,'0');
+    return`${y}-${mo}-${d}`;
+  }
+  if(typeof v==='string'&&v.trim()){
+    // 複数フォーマット対応: "2026/05/31 18:34", "2026-05-31 18:34:00", "05/31/2026 6:34 PM" など
+    const s=v.trim();
+    // YYYY/MM/DD or YYYY-MM-DD 形式（先頭4桁が年）
+    const m1=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+    if(m1)return`${m1[1]}-${m1[2].padStart(2,'0')}-${m1[3].padStart(2,'0')}`;
+    // MM/DD/YYYY 形式
+    const m2=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if(m2)return`${m2[3]}-${m2[1].padStart(2,'0')}-${m2[2].padStart(2,'0')}`;
+    // それ以外はDateオブジェクトで試みる
+    const dt=new Date(s);
+    if(!isNaN(dt.getTime())){
+      const y=dt.getFullYear(),mo=String(dt.getMonth()+1).padStart(2,'0'),d=String(dt.getDate()).padStart(2,'0');
+      return`${y}-${mo}-${d}`;
+    }
+  }
+  return null;
+}
+
+function handleBLP(input){
+  if(!input.files[0])return;
+  const fname=input.files[0].name;
+  const isCsv=fname.toLowerCase().endsWith('.csv');
+  const spin=document.getElementById('blp-spin'), st=document.getElementById('blp-st');
+  spin.style.display='inline-block'; st.textContent='読み込み中...'; st.className='upload-st';
+  const reader=new FileReader();
+  reader.onload=e=>{
+    setTimeout(()=>{
+      try{
+        const wb=isCsv
+          ? XLSX.read(e.target.result,{type:'string',cellDates:true})
+          : XLSX.read(new Uint8Array(e.target.result),{type:'array',cellDates:true});
+        // Sheet2優先、なければ最初のシート（CSV対応）
+        const ws=wb.Sheets['Sheet2']||wb.Sheets[wb.SheetNames[0]];
+        if(!ws)throw new Error('シートが見つかりません');
+        const encC=XLSX.utils.encode_cell;
+        const range=XLSX.utils.decode_range(ws['!ref']);
+        const daily={};
+        const cutoff='2026-04-01';
+
+        // ヘッダー行を動的に検出（CSVは1行目、Excelは2行目が多い）
+        let dataStartRow=3; // Excelデフォルト（0-indexed）
+        let colA=0, colW=22, colAG=32, colAK=36;
+        if(isCsv){
+          // CSVはヘッダーで列名を探す
+          for(let r=0;r<=Math.min(5,range.e.r);r++){
+            const cell=ws[encC({r,c:0})];
+            if(cell&&typeof cell.v==='string'&&cell.v.includes('グループ')){
+              // この行がヘッダー行、次行からデータ
+              dataStartRow=r+1;
+              // 各列をヘッダー名で検索
+              for(let c=0;c<=range.e.c;c++){
+                const h=ws[encC({r,c})];
+                if(!h)continue;
+                const hv=String(h.v);
+                if(hv.includes('持込'))colW=c;
+                else if(hv.includes('不成立'))colAK=c;
+                else if(hv.includes('査定日'))colAG=c;
+              }
+              break;
+            }
+          }
+        }
+
+        for(let r=dataStartRow;r<=range.e.r;r++){
+          const gc=ws[encC({r,c:colA})];
+          if(!gc||typeof gc.v!=='string')continue;
+          const g=G12_NORM[normGroup(gc.v)];
+          if(!g)continue;
+          const kc=ws[encC({r,c:colW})];
+          if(!kc||Number(kc.v)!==0)continue;
+          const fc=ws[encC({r,c:colAK})];
+          if(!fc||Number(fc.v)!==1)continue;
+          const dc=ws[encC({r,c:colAG})];
+          if(!dc)continue;
+          const ds=excelDateStr(dc.v);
+          if(!ds||ds<cutoff)continue;
+          if(!daily[ds])daily[ds]={};
+          daily[ds][g]=(daily[ds][g]||0)+1;
+        }
+        DAILY_FUSEI=daily;
+        spin.style.display='none'; st.textContent=fname; st.className='upload-st ok';
+        rebuildAll();
+      }catch(err){
+        spin.style.display='none'; st.textContent='エラー: '+err.message; st.className='upload-st err';
+      }
+    },50);
+  };
+  if(isCsv)reader.readAsText(input.files[0],'UTF-8');
+  else reader.readAsArrayBuffer(input.files[0]);
+}
+
+function handleHubspot(input){
+  if(!input.files[0])return;
+  const fname=input.files[0].name;
+  const isCsv=fname.toLowerCase().endsWith('.csv');
+  const spin=document.getElementById('hub-spin'), st=document.getElementById('hub-st');
+  spin.style.display='inline-block'; st.textContent='処理中...'; st.className='upload-st';
+  const reader=new FileReader();
+  reader.onload=e=>{
+    setTimeout(()=>{
+      try{
+        const wb=isCsv
+          ? XLSX.read(e.target.result,{type:'string',cellDates:true})
+          : XLSX.read(new Uint8Array(e.target.result),{type:'array',cellDates:true});
+        // 査定保証LINEシート優先、なければ最初のシート（CSV対応）
+        const ws=wb.Sheets['査定保証LINE']||wb.Sheets[wb.SheetNames[0]];
+        if(!ws)throw new Error('シートが見つかりません');
+
+        // ヘッダー行を取得して列インデックスを動的に検出
+        const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null});
+        if(rows.length<2)throw new Error('データが見つかりません');
+
+        const header=rows[0].map(h=>h?String(h):'');
+        let colDate=3, colArea=4; // Excelデフォルト
+        header.forEach((h,i)=>{
+          if(h.includes('作成日')||h.includes('Created'))colDate=i;
+          if(h.includes('不成立エリア')||h.includes('エリア'))colArea=i;
+        });
+
+        const monthly={}, daily={};
+        for(let i=1;i<rows.length;i++){
+          const row=rows[i];
+          const dv=row[colDate], gRaw=row[colArea];
+          if(!dv||!gRaw)continue;
+          const g=G12_NORM[normGroup(gRaw)];
+          if(!g)continue;
+          const ds=excelDateStr(dv);
+          if(!ds||ds<'2026-04-01')continue;
+          const ym=ds.slice(0,7);
+          if(!monthly[ym])monthly[ym]={};
+          monthly[ym][g]=(monthly[ym][g]||0)+1;
+          if(!daily[ds])daily[ds]={};
+          daily[ds][g]=(daily[ds][g]||0)+1;
+        }
+        MONTHLY_LINE=monthly; DAILY_LINE=daily;
+        rateSortM='curr';
+        spin.style.display='none'; st.textContent=fname; st.className='upload-st ok';
+        rebuildAll();
+      }catch(err){
+        spin.style.display='none'; st.textContent='エラー: '+err.message; st.className='upload-st err';
+      }
+    },50);
+  };
+  if(isCsv)reader.readAsText(input.files[0],'UTF-8');
+  else reader.readAsArrayBuffer(input.files[0]);
+}
+
+rebuildAll();
+</script>
+
+
+</body></html>
